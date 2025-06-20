@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from configs.configs import VisionConfig
+from models.blocks import MLP
 
 
 class SiglipVisionEmbeddings(nn.Module):
@@ -29,6 +30,34 @@ class SiglipVisionEmbeddings(nn.Module):
         if self.dropout is not None:
             embeddings = self.dropout(embeddings)
         return embeddings
+    
+class SiglipVisionEncoderLayer(nn.Module):
+
+    def __init__(self, config: VisionConfig):
+
+        super().__init__()
+        self.config = config
+        self.prenorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout_rate,
+            batch_first=True,
+            bias=False,
+        )
+        self.postnorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp = MLP(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        x_norm = self.prenorm(x)
+        attn_output, _ = self.attention(x_norm, x_norm, x_norm)
+        residual = x + attn_output
+        x = self.postnorm(residual)
+        x = self.mlp(x)
+        output = x + residual
+
+        return output
 
 
 class SiglipVisionEncoder(nn.Module):
@@ -39,12 +68,28 @@ class SiglipVisionEncoder(nn.Module):
         self.config = config
         self.embeddings = SiglipVisionEmbeddings(config)
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.encoder_layer = nn.ModuleList([SiglipVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.encoder_layers = nn.ModuleList([SiglipVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
 
         embeddings = self.embeddings(pixel_values)
-        for layer in self.encoder_layer:
-            embeddings = layer(embeddings)
-        embeddings = self.layernorm(embeddings)
-        return embeddings
+        for encoder_layer in self.encoder_layers:
+            embeddings = encoder_layer(embeddings)
+        output = self.layernorm(embeddings)
+
+        return output
+    
+
+def test_siglip_vision_encoder():
+
+    config = VisionConfig()
+    encoder = SiglipVisionEncoder(config).to("cuda")
+
+    x = torch.randn(1, 3, 224, 224).to("cuda")
+    print(encoder(x).shape)
+
+    # print number of parameters
+    print(sum(p.numel() for p in encoder.parameters()))
+
+
+test_siglip_vision_encoder()

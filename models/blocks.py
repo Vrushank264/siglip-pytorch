@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.SigLIP.configs import VisionConfig
+from configs.configs import VisionConfig
 
 
 class MLP(nn.Module):
@@ -9,8 +9,8 @@ class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
-        self.fc1 = nn.Linear(config.hidden_size, config.hidden_size)
-        self.fc2 = nn.Linear(config.hidden_size, config.hidden_size)
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
