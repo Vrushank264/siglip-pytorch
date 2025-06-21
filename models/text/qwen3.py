@@ -39,6 +39,50 @@ import torch.nn as nn
 from configs.configs import Qwen3Config
 
 
+class Qwen3MLP(nn.Module):
+  """
+  Gated MLP 
+  Helps in controlling the flow of information
+  """
+  def __init__(self, config: Qwen3Config):
+    super().__init__()
+    self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+    self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+    self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+    self.act_fn = nn.SiLU()
+    
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
+
+
+class Qwen3RMSNorm(nn.Module):
+
+  def __init__(self, config: Qwen3Config):
+    super().__init__()
+    self.weight = nn.Parameter(torch.ones(config.hidden_size))
+    self.variance_eps = 1e-6
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    
+    ip_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True) 
+    x = x * torch.rsqrt(variance + self.variance_eps)
+    return self.weight * x.to(ip_dtype)
+  
+
+class Qwen3Attention(nn.Module):
+  """
+  Multi-head attention with rotary embeddings and GQA
+  """
+  def __init__(self, config: Qwen3Config):
+    super().__init__()
+    pass
+
+  def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    pass
+  
+
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, config: Qwen3Config):
 
@@ -68,3 +112,5 @@ class Qwen3Model(nn.Module):
             x = layer(x, attention_mask)
         x = self.norm(x)
         return x
+    
+    
