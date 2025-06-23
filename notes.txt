@@ -1,0 +1,5 @@
+Option 3 Keep 3 M English, add one extra caption in one of the target languages per image, sample language on-the-fly
+ • Build an index that stores up to 3 captions (EN, HI, GU) for each image.
+ • At every epoch pick one language uniformly at random for each image; epoch-to-epoch the language changes.
+ ✓ Preserves all English diversity and gives you balanced exposure, while doubling rather than tripling compute.
+ ✓ In-batch negatives remain strong (each image appears only once per batch).
