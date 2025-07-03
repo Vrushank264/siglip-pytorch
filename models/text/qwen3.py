@@ -66,7 +66,11 @@ class Qwen3RMSNorm(nn.Module):
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
 
-    ip_dtype = x.dtype
+    if isinstance(x, tuple):
+      ip_dtype = x[0].dtype
+      x = x[0]
+    else:
+      ip_dtype = x.dtype
     x = x.to(torch.float32)
     variance = x.pow(2).mean(-1, keepdim=True) 
     x = x * torch.rsqrt(variance + self.variance_eps)
@@ -168,16 +172,13 @@ class Qwen3DecoderLayer(nn.Module):
       x = self.mlp(x)
       x = residual + x
 
-      outputs = (x,)
-      if output_attentions:
-         outputs += (attn_weights,)
-      return outputs
+      return x
   
 
 class Qwen3RotaryEmbedding(nn.Module):
    def __init__(self, config: Qwen3Config):
       super().__init__()
-      self.head_dim = config.hidden_size // config.num_attention_heads
+      self.head_dim = config.head_dim
       self.max_position_embeddings = config.max_position_embeddings
       self.register_buffer("inv_freq", 1.0 / (config.rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)), persistent=False)
    
@@ -217,6 +218,15 @@ class Qwen3Model(nn.Module):
         x = self.norm(x)
         return x
     
+class Qwen3ForSigLIP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.model = Qwen3Model(config)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        x = self.model(input_ids, attention_mask)
+        return x
+    
 
 def build_causal_attention_mask(seq_len: int,
                                 batch_size: int,
@@ -228,17 +238,28 @@ def build_causal_attention_mask(seq_len: int,
     mask = mask.unsqueeze(0).unsqueeze(0)        # (1,1,L,L)
     mask = mask.expand(batch_size, -1, -1, -1)   # (B,1,L,L)
     return mask
-
-def test_qwen3():
-   
-   config = Qwen3Config()
-   model = Qwen3Model(config)
-   print(model)
-   #print model parameters
-   print("Model parameters:")
-   print(sum(p.numel() for p in model.parameters()))
    
 
 if __name__ == "__main__":
-   test_qwen3()
+   # Load the state dict from huggingface
+   from transformers import AutoModelForCausalLM, AutoTokenizer
+   model_name = "Qwen/Qwen3-0.6B"
+   config = Qwen3Config()
+   model = Qwen3ForSigLIP(config)
+   tokenizer = AutoTokenizer.from_pretrained(model_name)
+   pretrained_model = AutoModelForCausalLM.from_pretrained(model_name)
+   state_dict = pretrained_model.state_dict()
+   state_dict = {k: v for k, v in state_dict.items() if not k.startswith("lm_head.")}
+
+   model.load_state_dict(state_dict, strict=False)
+   print(model)
+   print("Model parameters:")
+   print(sum(p.numel() for p in model.parameters()))
+
+   # Test the model
+   input_ids = tokenizer.encode("Hello, how are you?", return_tensors="pt")
+   attention_mask = torch.ones_like(input_ids)
+   output = model(input_ids, attention_mask)
+   print(output.shape)
+   
     
