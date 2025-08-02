@@ -15,10 +15,13 @@ from PIL import Image
 from transformers import AutoTokenizer
 from tqdm import tqdm
 import wandb
+from contextlib import nullcontext
 
 from configs.configs import VisionConfig, Qwen3Config
 from models.siglip import SigLIP
 from data.cc3m_dataset import CC3MDataset
+# new HF dataset loader
+from data.cc3m_dataset import HFCC3MDataset
 
 
 def init_distributed_mode() -> int:
@@ -127,8 +130,14 @@ def train(args):
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-    train_set = CC3MDataset(args.train_tsv, args.images_root, tokenizer, image_size=args.image_size)
-    val_set = CC3MDataset(args.val_tsv, args.images_root, tokenizer, image_size=args.image_size) if args.val_tsv else None
+    if args.use_hf:
+        train_set = HFCC3MDataset(tokenizer=tokenizer, image_size=args.image_size, num_samples=args.hf_num_samples)
+        val_set = None  # optional validation not supported for quick subset
+    else:
+        if not args.train_tsv or not args.images_root:
+            raise ValueError("--train-tsv and --images-root must be provided when not using --use-hf")
+        train_set = CC3MDataset(args.train_tsv, args.images_root, tokenizer, image_size=args.image_size)
+        val_set = CC3MDataset(args.val_tsv, args.images_root, tokenizer, image_size=args.image_size) if args.val_tsv else None
 
     train_sampler = DistributedSampler(train_set, shuffle=True)
     train_loader = DataLoader(train_set,
@@ -175,16 +184,27 @@ def train(args):
             images = images.to(device, non_blocking=True)
             input_ids = input_ids.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
+            # Use no_sync for all accumulation steps except the last one
+            if (step + 1) % accumulation_steps != 0:
+                with model.no_sync():
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        img_emb, txt_emb = model(images, input_ids, attention_mask)
+                        img_all, txt_all = gather_features(img_emb, txt_emb)
+                        loss = criterion(img_all, txt_all) / accumulation_steps
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                img_emb, txt_emb = model(images, input_ids, attention_mask)
-                img_all, txt_all = gather_features(img_emb, txt_emb)
-                loss = criterion(img_all, txt_all) / accumulation_steps
+                    loss.backward()
+                    running_loss += loss.item()
+            else:
+                # Last accumulation step - allow gradient sync
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    img_emb, txt_emb = model(images, input_ids, attention_mask)
+                    img_all, txt_all = gather_features(img_emb, txt_emb)
+                    loss = criterion(img_all, txt_all) / accumulation_steps
 
-            loss.backward()
-            running_loss += loss.item()
+                loss.backward()
+                running_loss += loss.item()
 
-            if (step + 1) % accumulation_steps == 0:
+                # Update parameters after accumulation is complete
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -222,9 +242,9 @@ def train(args):
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train SigLIP on CC3M with WandB logging and validation")
-    parser.add_argument("--train-tsv", type=str, required=True, help="Path to CC3M train TSV file")
+    parser.add_argument("--train-tsv", type=str, required=False, help="Path to CC3M train TSV file")
     parser.add_argument("--val-tsv", type=str, default=None, help="Optional path to CC3M val TSV file")
-    parser.add_argument("--images-root", type=str, required=True, help="Root directory containing CC3M images")
+    parser.add_argument("--images-root", type=str, default="", help="Root directory containing CC3M images (ignored when --use-hf)")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Where to save checkpoints")
     parser.add_argument("--batch-size", type=int, default=32, help="Per-GPU batch size")
     parser.add_argument("--val-batch-size", type=int, default=None, help="Validation batch size (defaults to train BS)")
@@ -236,6 +256,9 @@ def get_args():
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs")
     parser.add_argument("--accumulation-steps", type=int, default=4, help="Gradient accumulation steps")
+    # HuggingFace dataset options
+    parser.add_argument("--use-hf", action="store_true", help="Load CC3M via HuggingFace datasets instead of local TSVs")
+    parser.add_argument("--hf-num-samples", type=int, default=1000, help="Number of CC3M samples to fetch when --use-hf is set")
     # WandB
     parser.add_argument("--wandb-project", type=str, default=None, help="Weights&Biases project name (if None, wandb is disabled)")
     parser.add_argument("--wandb-run-name", type=str, default="siglip_run", help="WandB run name")
