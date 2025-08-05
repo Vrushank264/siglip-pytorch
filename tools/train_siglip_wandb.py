@@ -155,7 +155,8 @@ def train(args):
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
 
     criterion = SigmoidLoss().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    lr = args.lr * args.batch_size * dist.get_world_size() / 256
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
 
     if is_main_process() and args.wandb_project:
         wandb.init(project=args.wandb_project,
