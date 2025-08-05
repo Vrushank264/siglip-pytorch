@@ -246,14 +246,14 @@ class ViTModel(nn.Module):
         self.embeddings = ViTEmbeddings(config)
         self.encoder = ViTEncoder(config)
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.pooler = ViTPooler(config)
+        #self.pooler = ViTPooler(config)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         embeddings = self.embeddings(pixel_values)
         encoder_outputs = self.encoder(embeddings)
         sequence_output = self.layernorm(encoder_outputs)
-        pooled_output = self.pooler(sequence_output)
-        return sequence_output, pooled_output
+        #pooled_output = self.pooler(sequence_output)
+        return sequence_output
     
 
 def test_vit_model():
