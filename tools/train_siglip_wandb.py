@@ -15,7 +15,7 @@ from tqdm import tqdm
 import wandb
 
 from configs.configs import VisionConfig, Qwen3Config
-from models.siglip import SigLIP
+from models.siglip import SigLIP, load_pretrained_weights
 # new HF dataset loader
 from data.cc3m import CC3MDataset
 
@@ -150,12 +150,48 @@ def train(args):
 
     vision_cfg = VisionConfig()
     text_cfg = Qwen3Config()
-    model = SigLIP(vision_cfg, text_cfg, embed_dim=args.embed_dim).to(device)
+    model = SigLIP(vision_cfg, text_cfg, embed_dim=args.embed_dim)
+    
+    # Load pretrained weights only once on main process, then broadcast to other processes
+    if is_main_process():
+        load_pretrained_weights(model, vision_cfg, text_cfg)
+    
+    # Move to device and wrap with DDP
+    model = model.to(device)
+    if dist.is_initialized():
+        # Ensure all processes have the same weights
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
+    
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
 
     criterion = SigmoidLoss().to(device)
-    lr = args.lr * args.batch_size * dist.get_world_size() / 256
+    
+    # More conservative learning rate scaling for stability
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    effective_batch_size = args.batch_size * world_size * args.accumulation_steps
+    lr_scale = effective_batch_size / 256  # Scale based on effective batch size
+    lr = args.lr * min(lr_scale, 4.0)  # Cap the scaling to avoid too large LR
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    
+    # Learning rate scheduler with warmup
+    warmup_steps = args.warmup_steps
+    total_steps = len(train_loader) * args.epochs // args.accumulation_steps
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            # Cosine decay after warmup
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    if is_main_process():
+        logger.info(f"Learning rate: {lr:.6f} (scaled from {args.lr:.6f}, effective batch size: {effective_batch_size})")
+        logger.info(f"Warmup steps: {warmup_steps}, Total steps: {total_steps}")
 
     if is_main_process() and args.wandb_project:
         wandb.init(project=args.wandb_project,
@@ -195,13 +231,23 @@ def train(args):
                 loss.backward()
                 running_loss += loss.item()
 
-                # Update parameters after accumulation is complete
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
 
                 # Logging
-                if is_main_process() and args.wandb_project:
-                    wandb.log({"train_loss": running_loss * accumulation_steps}, step=global_step)
+                if is_main_process() and args.wandb_project and (step + 1) % 500 == 0:
+                    log_dict = {
+                        "train_loss": running_loss * accumulation_steps,
+                        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "learning_rate": optimizer.param_groups[0]['lr']
+                    }
+                    wandb.log(log_dict, step=global_step)
+                
+                if is_main_process() and global_step % 100 == 0:
+                    logger.info(f"Step {global_step} | Loss: {running_loss * accumulation_steps:.4f} | Grad norm: {grad_norm:.4f}")
+                
                 running_loss = 0.0
                 global_step += 1
 
@@ -253,6 +299,7 @@ def get_args():
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs")
     parser.add_argument("--accumulation-steps", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of warmup steps for learning rate")
     parser.add_argument("--wandb-project", type=str, default="SigLIP on CC3M", help="Weights&Biases project name (if None, wandb is disabled)")
     return parser.parse_args()
 
