@@ -23,7 +23,14 @@ class CC3MDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        image = self.transform(item['jpg'])
-        input_ids = self.tokenizer(item['txt'].strip(), return_tensors='pt', padding='max_length', truncation=True, max_length=77)
-        input_ids = input_ids['input_ids'].squeeze(0)
-        return image, input_ids
+        img = item['jpg']
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        image = self.transform(img)
+        tok_ids = self.tokenizer(item['txt'].strip(), return_tensors='pt', padding='max_length', truncation=True, max_length=77)
+        input_ids = tok_ids['input_ids'].squeeze(0)
+        if 'attention_mask' in tok_ids:
+            attention_mask = tok_ids['attention_mask'].squeeze(0)
+        else:
+            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        return image, input_ids, attention_mask

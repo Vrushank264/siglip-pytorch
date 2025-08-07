@@ -16,7 +16,6 @@ import wandb
 
 from configs.configs import VisionConfig, Qwen3Config
 from models.siglip import SigLIP
-from data.cc3m_dataset import CC3MDataset
 # new HF dataset loader
 from data.cc3m import CC3MDataset
 
@@ -25,10 +24,10 @@ def init_distributed_mode() -> int:
     """Initialise torch distributed and return the local rank."""
     if not dist.is_available():
         raise RuntimeError("torch.distributed is not available but distributed training was requested")
-
+    
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
-
+        
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank
@@ -160,11 +159,11 @@ def train(args):
 
     if is_main_process() and args.wandb_project:
         wandb.init(project=args.wandb_project,
-                   name=args.wandb_run_name,
                    config=vars(args))
 
     accumulation_steps = args.accumulation_steps
     global_step = 0
+    best_eval_r1 = 0.0
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
@@ -215,16 +214,26 @@ def train(args):
                 if args.wandb_project:
                     wandb.log(metrics, step=global_step)
 
+                if metrics['val_r1'] > best_eval_r1:
+                    best_eval_r1 = metrics['val_r1']
+                    ckpt_dir = Path(args.output_dir)
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    ckpt_path = ckpt_dir / f"best.pt"
+                    torch.save({
+                        "epoch": epoch + 1,
+                        "model_state": model.module.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                    }, ckpt_path)
+                    logger.info(f"New best R@1: {best_eval_r1*100:.2f}%. Saved checkpoint to {ckpt_path}")
+
         if is_main_process() and (epoch + 1) % args.save_every == 0:
             ckpt_dir = Path(args.output_dir)
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_path = ckpt_dir / f"siglip_epoch_{epoch+1}.pt"
+            ckpt_path = ckpt_dir / f"latest.pt"
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": model.module.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "logit_scale": criterion.logit_scale.item(),
-                "bias": criterion.bias.item(),
             }, ckpt_path)
             logger.info(f"Saved checkpoint to {ckpt_path}")
 
@@ -235,18 +244,16 @@ def train(args):
 def get_args():
     parser = argparse.ArgumentParser(description="Train SigLIP on CC3M with WandB logging and validation")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Where to save checkpoints")
-    parser.add_argument("--batch-size", type=int, default=128, help="Per-GPU batch size")
-    parser.add_argument("--val-batch-size", type=int, default=None, help="Validation batch size (defaults to train BS)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Per-GPU batch size")
+    parser.add_argument("--val-batch-size", type=int, default=8, help="Validation batch size (defaults to train BS)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--embed-dim", type=int, default=768)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs")
-    parser.add_argument("--accumulation-steps", type=int, default=4, help="Gradient accumulation steps")
-    # WandB
-    parser.add_argument("--wandb-project", type=str, default=None, help="Weights&Biases project name (if None, wandb is disabled)")
-    parser.add_argument("--wandb-run-name", type=str, default="siglip_run", help="WandB run name")
+    parser.add_argument("--accumulation-steps", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--wandb-project", type=str, default="SigLIP on CC3M", help="Weights&Biases project name (if None, wandb is disabled)")
     return parser.parse_args()
 
 
