@@ -59,16 +59,23 @@ def gather_features(image_features: torch.Tensor, text_features: torch.Tensor) -
     if world_size == 1:
         return image_features, text_features
 
+    # Placeholders for gathering
     img_list = [torch.zeros_like(image_features) for _ in range(world_size)]
     txt_list = [torch.zeros_like(text_features) for _ in range(world_size)]
 
+    # Gather detached features from all GPUs
     dist.all_gather(img_list, image_features.detach())
     dist.all_gather(txt_list, text_features.detach())
 
+    # Restore the original tensor for the current rank to keep the gradient
+    rank = dist.get_rank()
+    img_list[rank] = image_features
+    txt_list[rank] = text_features
+
+    # Concatenate all features
     img_all = torch.cat(img_list, dim=0)
     txt_all = torch.cat(txt_list, dim=0)
     return img_all, txt_all
-
 
 def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: torch.device) -> dict:
     """Run one validation epoch and return metrics dict."""
@@ -98,15 +105,16 @@ def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
             target = torch.arange(logits.size(0), device=logits.device)
             correct_r1 += (preds == target).sum().item()
 
-        avg_loss = total_loss / max(num_samples, 1)
-        r1 = correct_r1 / max(num_samples, 1)
-
-    # Ensure all ranks have the same metrics
+    # Aggregate metrics across all GPUs BEFORE computing ratios
     if dist.is_initialized():
-        tensor_metrics = torch.tensor([avg_loss, r1], device=device)
-        dist.all_reduce(tensor_metrics, op=dist.ReduceOp.SUM)
-        tensor_metrics /= dist.get_world_size()
-        avg_loss, r1 = tensor_metrics.tolist()
+        # Sum raw counts across all GPUs
+        metrics_tensor = torch.tensor([total_loss, correct_r1, num_samples], device=device, dtype=torch.float32)
+        dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+        total_loss, correct_r1, num_samples = metrics_tensor.tolist()
+
+    # Compute final ratios from aggregated counts
+    avg_loss = total_loss / max(num_samples, 1)
+    r1 = correct_r1 / max(num_samples, 1)
 
     return {"val_loss": avg_loss, "val_r1": r1}
 
