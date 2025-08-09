@@ -22,6 +22,9 @@ class SigLIP(nn.Module):
         # Projection heads
         self.vision_proj = nn.Linear(vision_cfg.hidden_size, embed_dim, bias=False)
         self.text_proj = nn.Linear(text_cfg.hidden_size, embed_dim, bias=False)
+        # Learnable temperature and bias for sigmoid loss
+        self.logit_scale = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1 / 0.07)))
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))
         
 
     def forward(self, pixel_values, input_ids, attention_mask):

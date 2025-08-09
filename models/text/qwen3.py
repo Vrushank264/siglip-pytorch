@@ -197,13 +197,13 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3Config):
-
+    def __init__(self, config: Qwen3Config, use_causal_mask: bool = True):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = Qwen3RMSNorm(config.hidden_size)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.use_causal_mask = use_causal_mask  # Add this parameter
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         bsz, seq_len = input_ids.shape
@@ -211,17 +211,33 @@ class Qwen3Model(nn.Module):
         position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
         pos_emb = self.rotary_emb(x, position_ids)
 
-        causal_mask = build_causal_attention_mask(seq_len, bsz, x.device, x.dtype)
+        # Build attention mask - optionally include causal mask
+        if self.use_causal_mask:
+            causal_mask = build_causal_attention_mask(seq_len, bsz, x.device, x.dtype)
+        else:
+            causal_mask = None
+
+        # Handle padding mask
+        if attention_mask is not None:
+            key_padding = (1.0 - attention_mask.float()).to(x.dtype) * -1e9
+            key_padding = key_padding.view(bsz, 1, 1, seq_len)
+            if causal_mask is not None:
+                attn_mask = causal_mask + key_padding
+            else:
+                attn_mask = key_padding
+        else:
+            attn_mask = causal_mask
 
         for layer in self.layers:
-            x = layer(x, pos_emb, causal_mask)
+            x = layer(x, pos_emb, attn_mask)
         x = self.norm(x)
         return x
     
 class Qwen3ForSigLIP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.model = Qwen3Model(config)
+        # Use bidirectional attention for encoding
+        self.model = Qwen3Model(config, use_causal_mask=False)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         x = self.model(input_ids, attention_mask)
