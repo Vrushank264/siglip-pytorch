@@ -16,7 +16,7 @@ import wandb
 
 from configs.configs import VisionConfig, Qwen3Config
 from models.siglip import SigLIP, load_pretrained_weights
-# new HF dataset loader
+
 from data.cc3m import CC3MDataset
 
 
@@ -81,8 +81,9 @@ def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
     """Run one validation epoch and return metrics dict."""
     model.eval()
     total_loss = 0.0
-    correct_r1 = 0
-    num_samples = 0
+    correct_r1 = 0.0
+    num_samples = 0.0
+    main_proc = is_main_process()
 
     with torch.no_grad():
         pbar = tqdm(dataloader, disable=not is_main_process(), desc="Val", dynamic_ncols=True)
@@ -96,18 +97,20 @@ def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
                 img_all, txt_all = gather_features(img_emb, txt_emb)
                 loss = criterion(img_all, txt_all)
 
-            total_loss += loss.item() * images.size(0)
-            num_samples += images.size(0)
-
-            # Retrieval R@1 on-the-fly (across gathered batch)
+            # Compute metrics once using gathered (global) batch size
             logits = img_all @ txt_all.t()
-            preds = logits.argmax(dim=1)
-            target = torch.arange(logits.size(0), device=logits.device)
-            correct_r1 += (preds == target).sum().item()
+            batch_global = float(logits.size(0))
+            if main_proc:
+                # Accumulate loss weighted by global batch to later average per-sample
+                total_loss += loss.item() * batch_global
+                num_samples += batch_global
+                # Retrieval R@1 on-the-fly (across gathered batch)
+                preds = logits.argmax(dim=1)
+                target = torch.arange(logits.size(0), device=logits.device)
+                correct_r1 += float((preds == target).sum().item())
 
-    # Aggregate metrics across all GPUs BEFORE computing ratios
     if dist.is_initialized():
-        # Sum raw counts across all GPUs
+        # Only main process accumulated metrics; sum to share across ranks
         metrics_tensor = torch.tensor([total_loss, correct_r1, num_samples], device=device, dtype=torch.float32)
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
         total_loss, correct_r1, num_samples = metrics_tensor.tolist()
@@ -123,16 +126,17 @@ def train(args):
     local_rank = init_distributed_mode()
     device = torch.device("cuda", local_rank)
 
-    # Logger (only rank-0 prints to stdout)
     logging.basicConfig(level=logging.INFO if is_main_process() else logging.WARNING,
                         format="%(asctime)s — %(levelname)s — %(message)s",
                         handlers=[logging.StreamHandler()])
     logger = logging.getLogger("siglip_train")
 
-    # Seed
-    torch.manual_seed(42 + local_rank)
+    torch.manual_seed(264 + local_rank)
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    # Ensure PAD token exists for proper attention masking
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     train_set = CC3MDataset(tokenizer=tokenizer, split='train')
     val_set = CC3MDataset(tokenizer=tokenizer, split='validation')
@@ -160,11 +164,9 @@ def train(args):
     text_cfg = Qwen3Config()
     model = SigLIP(vision_cfg, text_cfg, embed_dim=args.embed_dim)
     
-    # Load pretrained weights only once on main process, then broadcast to other processes
     if is_main_process():
         load_pretrained_weights(model, vision_cfg, text_cfg)
     
-    # Move to device and wrap with DDP
     model = model.to(device)
     if dist.is_initialized():
         # Ensure all processes have the same weights
@@ -175,15 +177,17 @@ def train(args):
 
     criterion = SigmoidLoss().to(device)
     
-    # More conservative learning rate scaling for stability
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     effective_batch_size = args.batch_size * world_size * args.accumulation_steps
-    lr_scale = effective_batch_size / 256  # Scale based on effective batch size
-    lr = args.lr * min(lr_scale, 4.0)  # Cap the scaling to avoid too large LR
+    lr_scale = effective_batch_size / 256  
+    lr = args.lr * min(lr_scale, 4.0)  
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    # Also optimize loss temperature and bias
+    optimizer = torch.optim.AdamW([
+        {"params": model.parameters(), "weight_decay": 1e-2},
+        {"params": criterion.parameters(), "weight_decay": 0.0},
+    ], lr=lr)
     
-    # Learning rate scheduler with warmup
     warmup_steps = args.warmup_steps
     total_steps = len(train_loader) * args.epochs // args.accumulation_steps
     
@@ -245,7 +249,7 @@ def train(args):
                 optimizer.zero_grad()
 
                 # Logging
-                if is_main_process() and args.wandb_project and (step + 1) % 500 == 0:
+                if is_main_process() and args.wandb_project:
                     log_dict = {
                         "train_loss": running_loss * accumulation_steps,
                         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
@@ -299,8 +303,8 @@ def get_args():
     parser = argparse.ArgumentParser(description="Train SigLIP on CC3M with WandB logging and validation")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Where to save checkpoints")
     parser.add_argument("--batch-size", type=int, default=16, help="Per-GPU batch size")
-    parser.add_argument("--val-batch-size", type=int, default=8, help="Validation batch size (defaults to train BS)")
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--val-batch-size", type=int, default=16, help="Validation batch size (defaults to train BS)")
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--embed-dim", type=int, default=768)
     parser.add_argument("--num-workers", type=int, default=8)
