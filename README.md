@@ -5,7 +5,7 @@ I reimplemented Vision Transformer (ViT) and Qwen3 from scratch and trained a Si
 - **From scratch**: custom ViT and Qwen3 implementations
 - **Architecture**: ViT-B/16 image encoder + Qwen3-0.6B text encoder, mean-pooled, then projected and L2-normalized
 - **Training**: multi-GPU DDP, grad accumulation, bfloat16 autocast, cosine LR schedule
-- **Data**: CC3M (loaded via `datasets`, pre-sharded WebDataset-style)
+- **Data**: CC3M (loaded via hugginface's  `datasets`, pre-sharded WebDataset-style)
 - **Result**: 71.4% R@1 on CC3M validation after 10 epochs on 4× L4 GPUs
 
 ### Install
